@@ -81,7 +81,11 @@ function runFfmpegMultipleClips({ clipPaths, audioPath, outputPath, width, heigh
   return new Promise((resolve, reject) => {
     const args = ["-y", "-hide_banner", "-loglevel", "info"];
 
+    // A TESOURA: Cortamos cada take em exatamente 3 segundos!
+    const TEMPO_POR_CORTE = "3"; 
+
     clipPaths.forEach(clip => {
+      args.push("-t", TEMPO_POR_CORTE); // Limita a entrada a 3 segundos
       args.push("-i", clip);
     });
     
@@ -109,7 +113,7 @@ function runFfmpegMultipleClips({ clipPaths, audioPath, outputPath, width, heigh
     args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "30");
     args.push("-c:a", "aac", "-b:a", "128k");
     args.push("-movflags", "+faststart");
-    args.push("-shortest"); 
+    args.push("-shortest"); // Encerra tudo quando a voz acabar
     args.push(outputPath);
 
     console.log("[ffmpeg] cmd:", `ffmpeg ${args.join(" ")}`);
@@ -174,9 +178,10 @@ app.post("/render", async (req, res) => {
         baseClipPaths.push(cPath);
       }
 
-      // REDUZIMOS PARA 6 TAKES PARA NÃO DERRUBAR A MEMÓRIA DO SERVIDOR GRATUITO
+      // 🔄 FILA AUMENTADA: Como cada vídeo tem só 3s, o servidor aguenta 20 vídeos.
+      // 20 takes x 3s = 60 segundos de vídeo final!
       const loopedClipPaths = [];
-      const MAX_FILA = 6; 
+      const MAX_FILA = 20; 
       
       while (loopedClipPaths.length < MAX_FILA) {
         for (const clip of baseClipPaths) {
@@ -186,7 +191,7 @@ app.post("/render", async (req, res) => {
         }
       }
       
-      console.log(`[job ${job_id}] Criada fila de repetição com ${loopedClipPaths.length} takes para economizar memória.`);
+      console.log(`[job ${job_id}] Fila com ${loopedClipPaths.length} takes rápidos de 3s.`);
 
       if (subtitle_url) {
         console.log(`[job ${job_id}] baixando arquivo de legenda...`);
