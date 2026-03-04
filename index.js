@@ -181,7 +181,7 @@ app.post("/render", async (req, res) => {
       // 🔄 FILA AUMENTADA: Como cada vídeo tem só 3s, o servidor aguenta 20 vídeos.
       // 20 takes x 3s = 60 segundos de vídeo final!
       const loopedClipPaths = [];
-      const MAX_FILA = 20; 
+      const MAX_FILA = 8; 
       
       while (loopedClipPaths.length < MAX_FILA) {
         for (const clip of baseClipPaths) {
