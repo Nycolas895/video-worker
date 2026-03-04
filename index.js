@@ -9,21 +9,18 @@ app.use(express.json({ limit: "50mb" }));
 
 // ---------- CONFIG (Render Env Vars) ----------
 const PORT = process.env.PORT || 3000;
-
-// Supabase upload
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const FINAL_BUCKET = process.env.FINAL_BUCKET || "final-videos";
 
-// Performance defaults
 const DEFAULT_WIDTH = parseInt(process.env.DEFAULT_WIDTH || "480", 10);
 const DEFAULT_HEIGHT = parseInt(process.env.DEFAULT_HEIGHT || "854", 10);
 const DEFAULT_FPS = parseInt(process.env.DEFAULT_FPS || "24", 10);
 
-const MAX_CLIPS = parseInt(process.env.MAX_CLIPS || "1", 10);
+// Agora o limite de clipes puxa do Render. Se não tiver configurado lá, o padrão é 3.
+const MAX_CLIPS = parseInt(process.env.MAX_CLIPS || "3", 10);
 // --------------------------------------------
 
-// Health checks
 app.get("/", (req, res) => res.send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -31,7 +28,6 @@ function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
 
-// Download de arquivos
 async function downloadToFile(url, filePath) {
   const r = await axios({
     url,
@@ -48,7 +44,6 @@ async function downloadToFile(url, filePath) {
   });
 }
 
-// Upload para o Supabase
 async function uploadMp4ToSupabase(localFilePath, objectPath) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados");
@@ -73,7 +68,6 @@ async function uploadMp4ToSupabase(localFilePath, objectPath) {
   return `${SUPABASE_URL}/storage/v1/object/public/${FINAL_BUCKET}/${objectPath}`;
 }
 
-// Webhook
 async function callWebhook(webhook_url, webhook_secret, payload) {
   await axios.post(webhook_url, payload, {
     headers: {
@@ -85,43 +79,51 @@ async function callWebhook(webhook_url, webhook_secret, payload) {
 }
 
 /**
- * FFmpeg leve com suporte a legendas
+ * FFmpeg: Concatena MÚLTIPLOS vídeos dinamicamente e aplica a legenda
  */
-function runFfmpegLoopSingleClip({ clipPath, audioPath, outputPath, width, height, fps, subtitlePath }) {
+function runFfmpegMultipleClips({ clipPaths, audioPath, outputPath, width, height, fps, subtitlePath }) {
   return new Promise((resolve, reject) => {
-    // Começamos o filtro de vídeo (escala e corte)
-    let vf = `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p`;
+    const args = ["-y", "-hide_banner", "-loglevel", "info"];
 
-    // Se existir uma legenda baixada, adicionamos ao filtro de vídeo!
+    // 1. Adiciona todos os vídeos baixados como input do ffmpeg
+    clipPaths.forEach(clip => {
+      args.push("-i", clip);
+    });
+    
+    // 2. O áudio será o último input
+    args.push("-i", audioPath);
+    const audioIndex = clipPaths.length;
+
+    // 3. Monta o filtro complexo de vídeo
+    let filterComplex = "";
+    let concatLabels = "";
+
+    // Prepara cada clipe cortando para 9:16 e mesmo FPS
+    clipPaths.forEach((_, i) => {
+      filterComplex += `[${i}:v]fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p[v${i}]; `;
+      concatLabels += `[v${i}]`;
+    });
+
+    // Cola (concat) todos os clipes preparados
+    filterComplex += `${concatLabels}concat=n=${clipPaths.length}:v=1:a=0[vout]`;
+
+    // Se tiver legenda, aplica por cima do vídeo final colado
     if (subtitlePath) {
-      vf += `,subtitles=${subtitlePath}`;
+      filterComplex += `; [vout]subtitles=${subtitlePath}[vout_sub]`;
     }
 
-    const args = [
-      "-y",
-      "-hide_banner",
-      "-loglevel", "info",
+    args.push("-filter_complex", filterComplex);
 
-      "-stream_loop", "-1",
-      "-i", clipPath,
-      "-i", audioPath,
+    // 4. Mapeia as trilhas para o arquivo final
+    args.push("-map", subtitlePath ? "[vout_sub]" : "[vout]");
+    args.push("-map", `${audioIndex}:a:0`); // Trilha de áudio
 
-      "-vf", vf, // Aplica os filtros (com ou sem legenda)
-
-      "-map", "0:v:0",
-      "-map", "1:a:0",
-
-      "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-crf", "30",
-
-      "-c:a", "aac",
-      "-b:a", "128k",
-
-      "-movflags", "+faststart",
-      "-shortest",
-      outputPath,
-    ];
+    // 5. Configurações de exportação
+    args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "30");
+    args.push("-c:a", "aac", "-b:a", "128k");
+    args.push("-movflags", "+faststart");
+    args.push("-shortest"); // Corta o vídeo quando o áudio acabar
+    args.push(outputPath);
 
     console.log("[ffmpeg] cmd:", `ffmpeg ${args.join(" ")}`);
 
@@ -148,7 +150,6 @@ app.post("/render", async (req, res) => {
   const broll_urls = body.broll_urls;
   const output_config = body.output_config || {};
   
-  // Pegando as possíveis legendas do Lovable (ele pode mandar como link ou como texto puro)
   const subtitle_url = body.subtitle_url || output_config.subtitle_url;
   const subtitle_text = body.subtitle_text || output_config.subtitle_text;
 
@@ -160,30 +161,35 @@ app.post("/render", async (req, res) => {
     return res.status(400).json({ error: "Campos obrigatórios ausentes" });
   }
 
-  // Responde imediatamente ao Lovable
   res.json({ status: "accepted", job_id });
 
-  // Processo em background
   (async () => {
     const workDir = path.join("/tmp", "video-worker", job_id);
     ensureDir(workDir);
 
     const audioPath = path.join(workDir, "audio.mp3");
-    const clipPath = path.join(workDir, "clip.mp4");
     const outputPath = path.join(workDir, "output.mp4");
     const srtPath = path.join(workDir, "subs.srt");
     
     let activeSubtitlePath = null;
+    const clipPaths = [];
 
     try {
       console.log(`[job ${job_id}] baixando áudio...`);
       await downloadToFile(audio_url, audioPath);
 
-      const clipUrl = broll_urls[0];
-      console.log(`[job ${job_id}] baixando 1 clipe...`);
-      await downloadToFile(clipUrl, clipPath);
+      // Limita a quantidade de clipes com base no MAX_CLIPS ou no que o Lovable mandou
+      const qtdClipes = Math.min(MAX_CLIPS, broll_urls.length);
+      console.log(`[job ${job_id}] Lovable enviou ${broll_urls.length} clipes. O servidor vai usar ${qtdClipes}.`);
 
-      // --- TRATAMENTO DAS LEGENDAS ---
+      // Baixa os clipes em loop
+      for (let i = 0; i < qtdClipes; i++) {
+        const cPath = path.join(workDir, `clip${i}.mp4`);
+        console.log(`[job ${job_id}] baixando clipe ${i + 1} de ${qtdClipes}...`);
+        await downloadToFile(broll_urls[i], cPath);
+        clipPaths.push(cPath);
+      }
+
       if (subtitle_url) {
         console.log(`[job ${job_id}] baixando arquivo de legenda...`);
         await downloadToFile(subtitle_url, srtPath);
@@ -194,23 +200,22 @@ app.post("/render", async (req, res) => {
         activeSubtitlePath = srtPath;
       }
 
-      console.log(`[job ${job_id}] iniciando ffmpeg (com suporte a legenda)...`);
-      await runFfmpegLoopSingleClip({ 
-          clipPath, 
+      console.log(`[job ${job_id}] iniciando ffmpeg com ${clipPaths.length} clipes e legenda...`);
+      await runFfmpegMultipleClips({ 
+          clipPaths, 
           audioPath, 
           outputPath, 
           width, 
           height, 
           fps, 
-          subtitlePath: activeSubtitlePath // Passando a legenda pro FFmpeg
+          subtitlePath: activeSubtitlePath
       });
       console.log(`[job ${job_id}] ffmpeg finalizou ✅`);
 
       console.log(`[job ${job_id}] upload Supabase...`);
       const objectPath = `final/${job_id}.mp4`;
       const video_url = await uploadMp4ToSupabase(outputPath, objectPath);
-      console.log(`[job ${job_id}] upload OK:`, video_url);
-
+      
       await callWebhook(webhook_url, webhook_secret, { job_id, status: "completed", video_url });
       
     } catch (e) {
