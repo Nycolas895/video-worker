@@ -2,7 +2,7 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const { exec } = require("child_process");
+const { spawn } = require("child_process");
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
@@ -10,19 +10,38 @@ app.use(express.json({ limit: "50mb" }));
 // ---------- CONFIG (Render Env Vars) ----------
 const PORT = process.env.PORT || 3000;
 
-// Supabase upload (NECESSÁRIO para gerar video_url)
+// Supabase upload
 const SUPABASE_URL = process.env.SUPABASE_URL; // ex: https://xxxxx.supabase.co
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // segredo (não poste)
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // segredo
 const FINAL_BUCKET = process.env.FINAL_BUCKET || "final-videos"; // bucket public
+
+// Performance defaults (Render free)
+const DEFAULT_WIDTH = parseInt(process.env.DEFAULT_WIDTH || "480", 10);   // 480x854 é leve
+const DEFAULT_HEIGHT = parseInt(process.env.DEFAULT_HEIGHT || "854", 10);
+const DEFAULT_FPS = parseInt(process.env.DEFAULT_FPS || "24", 10);
+
+// Quantidade de clipes (por enquanto 1 para garantir que funcione)
+const MAX_CLIPS = parseInt(process.env.MAX_CLIPS || "1", 10);
 // --------------------------------------------
 
 // Health checks
 app.get("/", (req, res) => res.send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Util: download stream -> file
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
+// Util: download stream -> file (sem colocar tudo na RAM)
 async function downloadToFile(url, filePath) {
-  const r = await axios({ url, responseType: "stream", timeout: 60000 });
+  const r = await axios({
+    url,
+    responseType: "stream",
+    timeout: 120000,
+    // alguns hosts bloqueiam sem user-agent
+    headers: { "User-Agent": "video-worker/1.0" },
+  });
+
   await new Promise((resolve, reject) => {
     const w = fs.createWriteStream(filePath);
     r.data.pipe(w);
@@ -31,69 +50,94 @@ async function downloadToFile(url, filePath) {
   });
 }
 
-// Util: ensure dir
-function ensureDir(p) {
-  fs.mkdirSync(p, { recursive: true });
-}
-
-// Upload MP4 to Supabase Storage (bucket must be public)
+// Upload MP4 to Supabase Storage via STREAM (sem estourar RAM)
 async function uploadMp4ToSupabase(localFilePath, objectPath) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados no Render");
   }
 
   const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${FINAL_BUCKET}/${objectPath}`;
-  const fileBuffer = fs.readFileSync(localFilePath);
 
-  await axios.post(uploadUrl, fileBuffer, {
+  const stat = fs.statSync(localFilePath);
+  const stream = fs.createReadStream(localFilePath);
+
+  // PUT é o mais comum no Storage API
+  await axios.put(uploadUrl, stream, {
     headers: {
       Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
       "Content-Type": "video/mp4",
+      "Content-Length": stat.size,
       "x-upsert": "true",
     },
     maxBodyLength: Infinity,
     maxContentLength: Infinity,
-    timeout: 120000,
+    timeout: 300000, // 5 min pro upload
   });
 
-  // Public URL (bucket precisa ser public)
+  // bucket precisa ser public
   return `${SUPABASE_URL}/storage/v1/object/public/${FINAL_BUCKET}/${objectPath}`;
 }
 
-// Call Lovable webhook
 async function callWebhook(webhook_url, webhook_secret, payload) {
   await axios.post(webhook_url, payload, {
     headers: {
       "Content-Type": "application/json",
       "x-webhook-secret": webhook_secret,
     },
-    timeout: 20000,
+    timeout: 30000,
   });
 }
 
 /**
- * FFmpeg: cria um vídeo vertical 1080x1920 a partir de vários clipes.
- * - reescala e corta para 9:16
- * - concatena
- * - coloca narração
- * - queima legenda (opcional)
+ * FFmpeg leve:
+ * - baixa 1 clipe
+ * - LOOPA o clipe até acabar o áudio (-stream_loop -1)
+ * - reescala e crop pra 9:16
+ * - -shortest termina junto com o áudio
  */
-function buildFfmpegCommand({ clipsTxtPath, audioPath, subtitlePath, outputPath, burnSubtitles }) {
-  // Para paths no Windows/Render, escapar barras para o filtro subtitles
-  const subFilter = burnSubtitles && subtitlePath
-    ? `,subtitles='${subtitlePath.replace(/\\/g, "\\\\").replace(/:/g, "\\:")}'`
-    : "";
+function runFfmpegLoopSingleClip({ clipPath, audioPath, outputPath, width, height, fps }) {
+  return new Promise((resolve, reject) => {
+    const vf = `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p`;
 
-  // Pipeline:
-  // - concat demuxer: lê lista de arquivos local
-  // - força 30fps, escala/crop para 1080x1920
-  // - áudio AAC
-  // - -shortest para terminar com o áudio
-  const vf = `fps=30,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920${subFilter}`;
+    const args = [
+      "-y",
+      "-hide_banner",
+      "-loglevel", "info",
 
-  return `ffmpeg -y -f concat -safe 0 -i "${clipsTxtPath}" -i "${audioPath}" ` +
-         `-vf "${vf}" -map 0:v:0 -map 1:a:0 ` +
-         `-c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 192k -shortest "${outputPath}"`;
+      "-stream_loop", "-1",
+      "-i", clipPath,
+      "-i", audioPath,
+
+      "-vf", vf,
+
+      "-map", "0:v:0",
+      "-map", "1:a:0",
+
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-crf", "30",
+
+      "-c:a", "aac",
+      "-b:a", "128k",
+
+      "-movflags", "+faststart",
+      "-shortest",
+      outputPath,
+    ];
+
+    console.log("[ffmpeg] cmd:", `ffmpeg ${args.join(" ")}`);
+
+    const p = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    p.stdout.on("data", (d) => console.log("[ffmpeg][out]", d.toString().trim()));
+    p.stderr.on("data", (d) => console.log("[ffmpeg][err]", d.toString().trim()));
+
+    p.on("error", (err) => reject(err));
+    p.on("close", (code) => {
+      if (code === 0) return resolve();
+      reject(new Error(`ffmpeg saiu com code ${code}`));
+    });
+  });
 }
 
 app.post("/render", async (req, res) => {
@@ -104,18 +148,19 @@ app.post("/render", async (req, res) => {
   const webhook_secret = body.webhook_secret;
   const audio_url = body.audio_url;
   const broll_urls = body.broll_urls;
-  const subtitle_url = body.subtitle_url || null;
   const output_config = body.output_config || {};
 
-  const burn_subtitles = output_config.burn_subtitles === true; // padrão false se não vier
+  // Vamos ignorar burn_subtitles por enquanto no free (muito pesado)
+  // Se quiser ativar depois, dá, mas primeiro vamos fazer gerar vídeo.
+  const width = Number(output_config.width || DEFAULT_WIDTH);
+  const height = Number(output_config.height || DEFAULT_HEIGHT);
+  const fps = Number(output_config.fps || DEFAULT_FPS);
 
-  // Logs de entrada (aparecem no Render)
   console.log("[/render] RECEBI JOB:", job_id);
   console.log("[/render] broll_urls:", Array.isArray(broll_urls) ? broll_urls.length : "INVALID");
-  console.log("[/render] subtitle_url:", subtitle_url ? "YES" : "NO");
   console.log("[/render] webhook_url:", webhook_url);
+  console.log("[/render] config:", { width, height, fps, MAX_CLIPS });
 
-  // validação
   if (!job_id || !webhook_url || !webhook_secret || !audio_url || !Array.isArray(broll_urls) || broll_urls.length === 0) {
     console.log("[/render] ERRO: payload incompleto");
     return res.status(400).json({
@@ -123,100 +168,47 @@ app.post("/render", async (req, res) => {
     });
   }
 
-  // ✅ Responde IMEDIATO (evita timeout do assemble-video)
-  console.log("[/render] RESPONDI accepted:", job_id);
+  // ✅ responde IMEDIATO
   res.json({ status: "accepted", job_id });
 
-  // ✅ Processa em background
+  // ✅ background
   (async () => {
-    const workDir = path.join(__dirname, "tmp", job_id);
+    // Use /tmp (mais seguro no Render)
+    const workDir = path.join("/tmp", "video-worker", job_id);
     ensureDir(workDir);
 
     const audioPath = path.join(workDir, "audio.mp3");
-    const subtitlePath = path.join(workDir, "subs.srt");
+    const clipPath = path.join(workDir, "clip.mp4");
     const outputPath = path.join(workDir, "output.mp4");
-    const clipsDir = path.join(workDir, "clips");
-    ensureDir(clipsDir);
-
-    // arquivo de concat (ffmpeg concat demuxer)
-    const clipsTxtPath = path.join(workDir, "clips.txt");
 
     try {
-      console.log("[job] baixando áudio...");
+      console.log(`[job ${job_id}] baixando áudio...`);
       await downloadToFile(audio_url, audioPath);
 
-      // baixa alguns clipes (MVP: até 10, mas você pode aumentar)
-      const maxClips = Math.min(10, broll_urls.length);
-      console.log(`[job] baixando ${maxClips} clipes...`);
+      // Por enquanto 1 clipe para garantir que funciona
+      const clipUrl = broll_urls[0];
+      console.log(`[job ${job_id}] baixando 1 clipe...`);
+      await downloadToFile(clipUrl, clipPath);
 
-      const localClips = [];
-      for (let i = 0; i < maxClips; i++) {
-        const clipUrl = broll_urls[i];
-        const clipPath = path.join(clipsDir, `clip_${i}.mp4`);
-        await downloadToFile(clipUrl, clipPath);
-        localClips.push(clipPath);
-      }
+      console.log(`[job ${job_id}] iniciando ffmpeg (leve, 1 clipe loop)...`);
+      await runFfmpegLoopSingleClip({ clipPath, audioPath, outputPath, width, height, fps });
+      console.log(`[job ${job_id}] ffmpeg finalizou ✅`);
 
-      // legenda
-      if (subtitle_url && burn_subtitles) {
-        console.log("[job] baixando legendas...");
-        await downloadToFile(subtitle_url, subtitlePath);
-      }
-
-      // cria clips.txt
-      // formato: file 'path'
-      const txt = localClips.map(p => `file '${p.replace(/\\/g, "/")}'`).join("\n");
-      fs.writeFileSync(clipsTxtPath, txt, "utf8");
-
-      console.log("[ffmpeg] iniciando render...");
-      const cmd = buildFfmpegCommand({
-        clipsTxtPath,
-        audioPath,
-        subtitlePath,
-        outputPath,
-        burnSubtitles: burn_subtitles && !!subtitle_url,
-      });
-
-      await new Promise((resolve, reject) => {
-        exec(cmd, (err, stdout, stderr) => {
-          if (err) {
-            console.log("[ffmpeg] ERRO:", stderr || err.message);
-            return reject(new Error(stderr || err.message));
-          }
-          resolve();
-        });
-      });
-
-      console.log("[ffmpeg] finalizou:", outputPath);
-
-      // Upload para Supabase -> URL pública
-      console.log("[upload] enviando para Supabase Storage...");
+      console.log(`[job ${job_id}] upload Supabase...`);
       const objectPath = `final/${job_id}.mp4`;
       const video_url = await uploadMp4ToSupabase(outputPath, objectPath);
+      console.log(`[job ${job_id}] upload OK:`, video_url);
 
-      console.log("[upload] OK, video_url:", video_url);
-
-      // Callback sucesso
-      console.log("[webhook] chamando completed...");
-      await callWebhook(webhook_url, webhook_secret, {
-        job_id,
-        status: "completed",
-        video_url,
-      });
-      console.log("[webhook] completed enviado com sucesso ✅");
-
+      console.log(`[job ${job_id}] chamando webhook completed...`);
+      await callWebhook(webhook_url, webhook_secret, { job_id, status: "completed", video_url });
+      console.log(`[job ${job_id}] webhook completed enviado ✅`);
     } catch (e) {
-      console.log("[job] FALHOU:", job_id, e.message);
+      console.log(`[job ${job_id}] FALHOU:`, e?.message || e);
 
-      // Callback erro
       try {
-        console.log("[webhook] chamando failed...");
-        await callWebhook(webhook_url, webhook_secret, {
-          job_id,
-          status: "failed",
-          error: e.message,
-        });
-        console.log("[webhook] failed enviado ✅");
+        console.log(`[job ${job_id}] chamando webhook failed...`);
+        await callWebhook(webhook_url, webhook_secret, { job_id, status: "failed", error: e?.message || String(e) });
+        console.log(`[job ${job_id}] webhook failed enviado ✅`);
       } catch (err2) {
         console.log("[webhook] ERRO ao enviar failed:", err2.response?.status, err2.response?.data || err2.message);
       }
@@ -224,6 +216,4 @@ app.post("/render", async (req, res) => {
   })();
 });
 
-app.listen(PORT, () => {
-  console.log("Worker rodando na porta", PORT);
-});
+app.listen(PORT, () => console.log("Worker rodando na porta", PORT));
