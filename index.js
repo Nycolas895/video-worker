@@ -109,7 +109,7 @@ function runFfmpegMultipleClips({ clipPaths, audioPath, outputPath, width, heigh
     args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "30");
     args.push("-c:a", "aac", "-b:a", "128k");
     args.push("-movflags", "+faststart");
-    args.push("-shortest"); // Isso aqui vai cortar o vídeo na exata hora que a voz acabar!
+    args.push("-shortest"); 
     args.push(outputPath);
 
     console.log("[ffmpeg] cmd:", `ffmpeg ${args.join(" ")}`);
@@ -174,11 +174,9 @@ app.post("/render", async (req, res) => {
         baseClipPaths.push(cPath);
       }
 
-      // 🔄 O TRUQUE MÁGICO DO LOOP
-      // Vamos repetir os vídeos que já baixamos até formar uma fila de 15 takes.
-      // 15 takes de ~5 segundos = 75 segundos de vídeo (Cobre qualquer narração de Reels/Shorts)
+      // REDUZIMOS PARA 6 TAKES PARA NÃO DERRUBAR A MEMÓRIA DO SERVIDOR GRATUITO
       const loopedClipPaths = [];
-      const MAX_FILA = 15; 
+      const MAX_FILA = 6; 
       
       while (loopedClipPaths.length < MAX_FILA) {
         for (const clip of baseClipPaths) {
@@ -188,7 +186,7 @@ app.post("/render", async (req, res) => {
         }
       }
       
-      console.log(`[job ${job_id}] Criada fila de repetição com ${loopedClipPaths.length} takes para cobrir todo o áudio.`);
+      console.log(`[job ${job_id}] Criada fila de repetição com ${loopedClipPaths.length} takes para economizar memória.`);
 
       if (subtitle_url) {
         console.log(`[job ${job_id}] baixando arquivo de legenda...`);
@@ -202,7 +200,7 @@ app.post("/render", async (req, res) => {
 
       console.log(`[job ${job_id}] iniciando ffmpeg...`);
       await runFfmpegMultipleClips({ 
-          clipPaths: loopedClipPaths, // Enviamos a fila gigante pro FFmpeg
+          clipPaths: loopedClipPaths, 
           audioPath, 
           outputPath, 
           width, 
