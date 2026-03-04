@@ -17,7 +17,6 @@ const DEFAULT_WIDTH = parseInt(process.env.DEFAULT_WIDTH || "480", 10);
 const DEFAULT_HEIGHT = parseInt(process.env.DEFAULT_HEIGHT || "854", 10);
 const DEFAULT_FPS = parseInt(process.env.DEFAULT_FPS || "24", 10);
 
-// Agora o limite de clipes puxa do Render. Se não tiver configurado lá, o padrão é 3.
 const MAX_CLIPS = parseInt(process.env.MAX_CLIPS || "3", 10);
 // --------------------------------------------
 
@@ -78,51 +77,39 @@ async function callWebhook(webhook_url, webhook_secret, payload) {
   });
 }
 
-/**
- * FFmpeg: Concatena MÚLTIPLOS vídeos dinamicamente e aplica a legenda
- */
 function runFfmpegMultipleClips({ clipPaths, audioPath, outputPath, width, height, fps, subtitlePath }) {
   return new Promise((resolve, reject) => {
     const args = ["-y", "-hide_banner", "-loglevel", "info"];
 
-    // 1. Adiciona todos os vídeos baixados como input do ffmpeg
     clipPaths.forEach(clip => {
       args.push("-i", clip);
     });
     
-    // 2. O áudio será o último input
     args.push("-i", audioPath);
     const audioIndex = clipPaths.length;
 
-    // 3. Monta o filtro complexo de vídeo
     let filterComplex = "";
     let concatLabels = "";
 
-    // Prepara cada clipe cortando para 9:16 e mesmo FPS
     clipPaths.forEach((_, i) => {
       filterComplex += `[${i}:v]fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p[v${i}]; `;
       concatLabels += `[v${i}]`;
     });
 
-    // Cola (concat) todos os clipes preparados
     filterComplex += `${concatLabels}concat=n=${clipPaths.length}:v=1:a=0[vout]`;
 
-    // Se tiver legenda, aplica por cima do vídeo final colado
     if (subtitlePath) {
       filterComplex += `; [vout]subtitles=${subtitlePath}[vout_sub]`;
     }
 
     args.push("-filter_complex", filterComplex);
-
-    // 4. Mapeia as trilhas para o arquivo final
     args.push("-map", subtitlePath ? "[vout_sub]" : "[vout]");
-    args.push("-map", `${audioIndex}:a:0`); // Trilha de áudio
+    args.push("-map", `${audioIndex}:a:0`);
 
-    // 5. Configurações de exportação
     args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "30");
     args.push("-c:a", "aac", "-b:a", "128k");
     args.push("-movflags", "+faststart");
-    args.push("-shortest"); // Corta o vídeo quando o áudio acabar
+    args.push("-shortest"); // Isso aqui vai cortar o vídeo na exata hora que a voz acabar!
     args.push(outputPath);
 
     console.log("[ffmpeg] cmd:", `ffmpeg ${args.join(" ")}`);
@@ -172,23 +159,36 @@ app.post("/render", async (req, res) => {
     const srtPath = path.join(workDir, "subs.srt");
     
     let activeSubtitlePath = null;
-    const clipPaths = [];
+    const baseClipPaths = [];
 
     try {
       console.log(`[job ${job_id}] baixando áudio...`);
       await downloadToFile(audio_url, audioPath);
 
-      // Limita a quantidade de clipes com base no MAX_CLIPS ou no que o Lovable mandou
       const qtdClipes = Math.min(MAX_CLIPS, broll_urls.length);
-      console.log(`[job ${job_id}] Lovable enviou ${broll_urls.length} clipes. O servidor vai usar ${qtdClipes}.`);
+      console.log(`[job ${job_id}] Baixando ${qtdClipes} clipes reais...`);
 
-      // Baixa os clipes em loop
       for (let i = 0; i < qtdClipes; i++) {
         const cPath = path.join(workDir, `clip${i}.mp4`);
-        console.log(`[job ${job_id}] baixando clipe ${i + 1} de ${qtdClipes}...`);
         await downloadToFile(broll_urls[i], cPath);
-        clipPaths.push(cPath);
+        baseClipPaths.push(cPath);
       }
+
+      // 🔄 O TRUQUE MÁGICO DO LOOP
+      // Vamos repetir os vídeos que já baixamos até formar uma fila de 15 takes.
+      // 15 takes de ~5 segundos = 75 segundos de vídeo (Cobre qualquer narração de Reels/Shorts)
+      const loopedClipPaths = [];
+      const MAX_FILA = 15; 
+      
+      while (loopedClipPaths.length < MAX_FILA) {
+        for (const clip of baseClipPaths) {
+          if (loopedClipPaths.length < MAX_FILA) {
+            loopedClipPaths.push(clip);
+          }
+        }
+      }
+      
+      console.log(`[job ${job_id}] Criada fila de repetição com ${loopedClipPaths.length} takes para cobrir todo o áudio.`);
 
       if (subtitle_url) {
         console.log(`[job ${job_id}] baixando arquivo de legenda...`);
@@ -200,9 +200,9 @@ app.post("/render", async (req, res) => {
         activeSubtitlePath = srtPath;
       }
 
-      console.log(`[job ${job_id}] iniciando ffmpeg com ${clipPaths.length} clipes e legenda...`);
+      console.log(`[job ${job_id}] iniciando ffmpeg...`);
       await runFfmpegMultipleClips({ 
-          clipPaths, 
+          clipPaths: loopedClipPaths, // Enviamos a fila gigante pro FFmpeg
           audioPath, 
           outputPath, 
           width, 
