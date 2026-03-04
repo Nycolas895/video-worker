@@ -16,7 +16,6 @@ const FINAL_BUCKET = process.env.FINAL_BUCKET || "final-videos";
 const DEFAULT_WIDTH = parseInt(process.env.DEFAULT_WIDTH || "480", 10);
 const DEFAULT_HEIGHT = parseInt(process.env.DEFAULT_HEIGHT || "854", 10);
 const DEFAULT_FPS = parseInt(process.env.DEFAULT_FPS || "24", 10);
-
 const MAX_CLIPS = parseInt(process.env.MAX_CLIPS || "3", 10);
 // --------------------------------------------
 
@@ -77,53 +76,16 @@ async function callWebhook(webhook_url, webhook_secret, payload) {
   });
 }
 
-function runFfmpegMultipleClips({ clipPaths, audioPath, outputPath, width, height, fps, subtitlePath }) {
+// Função auxiliar genérica para rodar qualquer comando do ffmpeg
+function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
-    const args = ["-y", "-hide_banner", "-loglevel", "info"];
-
-    // A TESOURA: Cortamos cada take em exatamente 3 segundos!
-    const TEMPO_POR_CORTE = "3"; 
-
-    clipPaths.forEach(clip => {
-      args.push("-t", TEMPO_POR_CORTE); // Limita a entrada a 3 segundos
-      args.push("-i", clip);
-    });
-    
-    args.push("-i", audioPath);
-    const audioIndex = clipPaths.length;
-
-    let filterComplex = "";
-    let concatLabels = "";
-
-    clipPaths.forEach((_, i) => {
-      filterComplex += `[${i}:v]fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p[v${i}]; `;
-      concatLabels += `[v${i}]`;
-    });
-
-    filterComplex += `${concatLabels}concat=n=${clipPaths.length}:v=1:a=0[vout]`;
-
-    if (subtitlePath) {
-      filterComplex += `; [vout]subtitles=${subtitlePath}[vout_sub]`;
-    }
-
-    args.push("-filter_complex", filterComplex);
-    args.push("-map", subtitlePath ? "[vout_sub]" : "[vout]");
-    args.push("-map", `${audioIndex}:a:0`);
-
-    args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "30");
-    args.push("-c:a", "aac", "-b:a", "128k");
-    args.push("-movflags", "+faststart");
-    args.push("-shortest"); // Encerra tudo quando a voz acabar
-    args.push(outputPath);
-
     console.log("[ffmpeg] cmd:", `ffmpeg ${args.join(" ")}`);
-
     const p = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
 
     p.stdout.on("data", (d) => console.log("[ffmpeg][out]", d.toString().trim()));
     p.stderr.on("data", (d) => console.log("[ffmpeg][err]", d.toString().trim()));
 
-    p.on("error", (err) => reject(err));
+    p.on("error", reject);
     p.on("close", (code) => {
       if (code === 0) return resolve();
       reject(new Error(`ffmpeg saiu com code ${code}`));
@@ -178,21 +140,39 @@ app.post("/render", async (req, res) => {
         baseClipPaths.push(cPath);
       }
 
-      // 🔄 FILA AUMENTADA: Como cada vídeo tem só 3s, o servidor aguenta 20 vídeos.
-      // 20 takes x 3s = 60 segundos de vídeo final!
-      const loopedClipPaths = [];
-      const MAX_FILA = 8; 
-      
-      while (loopedClipPaths.length < MAX_FILA) {
-        for (const clip of baseClipPaths) {
-          if (loopedClipPaths.length < MAX_FILA) {
-            loopedClipPaths.push(clip);
-          }
+      // PASSO 1: PREPARAÇÃO (Cortar e formatar cada clipe separadamente - Salva Muita Memória!)
+      const normalizedClips = [];
+      const vf = `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p`;
+
+      for (let i = 0; i < baseClipPaths.length; i++) {
+        const normPath = path.join(workDir, `norm_${i}.mp4`);
+        console.log(`[job ${job_id}] Normalizando clipe ${i + 1}...`);
+        
+        await runFfmpeg([
+          "-y", "-hide_banner", "-loglevel", "error",
+          "-t", "3", // A Tesoura: corta exatamente em 3 segundos
+          "-i", baseClipPaths[i],
+          "-vf", vf,
+          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+          "-an", // Remove o áudio original do vídeo
+          normPath
+        ]);
+        normalizedClips.push(normPath);
+      }
+
+      // PASSO 2: CRIAR A PLAYLIST DE TEXTO
+      // Vamos repetir os clipes 30 vezes. 30 ciclos * 3 clipes * 3 segundos = 270 segundos (4,5 minutos).
+      // Isso cobre qualquer vídeo, e o comando "-shortest" vai cortar no tempo exato da voz.
+      const playlistPath = path.join(workDir, "playlist.txt");
+      let playlistContent = "";
+      for (let loop = 0; loop < 30; loop++) {
+        for (const clip of normalizedClips) {
+          playlistContent += `file '${clip}'\n`;
         }
       }
-      
-      console.log(`[job ${job_id}] Fila com ${loopedClipPaths.length} takes rápidos de 3s.`);
+      fs.writeFileSync(playlistPath, playlistContent);
 
+      // Tratamento da legenda
       if (subtitle_url) {
         console.log(`[job ${job_id}] baixando arquivo de legenda...`);
         await downloadToFile(subtitle_url, srtPath);
@@ -203,16 +183,29 @@ app.post("/render", async (req, res) => {
         activeSubtitlePath = srtPath;
       }
 
-      console.log(`[job ${job_id}] iniciando ffmpeg...`);
-      await runFfmpegMultipleClips({ 
-          clipPaths: loopedClipPaths, 
-          audioPath, 
-          outputPath, 
-          width, 
-          height, 
-          fps, 
-          subtitlePath: activeSubtitlePath
-      });
+      // PASSO 3: JUNTAR TUDO (Lendo a playlist e adicionando o áudio e a legenda)
+      console.log(`[job ${job_id}] iniciando montagem final do vídeo...`);
+      const finalArgs = [
+        "-y", "-hide_banner", "-loglevel", "info",
+        "-f", "concat", "-safe", "0", "-i", playlistPath, // Lê a playlist de vídeos
+        "-i", audioPath // Lê o áudio
+      ];
+
+      if (activeSubtitlePath) {
+        finalArgs.push("-vf", `subtitles=${activeSubtitlePath}`);
+      }
+
+      finalArgs.push(
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-shortest", // Corta a imagem EXATAMENTE na hora que a voz acaba
+        outputPath
+      );
+
+      await runFfmpeg(finalArgs);
       console.log(`[job ${job_id}] ffmpeg finalizou ✅`);
 
       console.log(`[job ${job_id}] upload Supabase...`);
