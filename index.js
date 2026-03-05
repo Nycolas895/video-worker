@@ -206,7 +206,7 @@ app.post("/render", async (req, res) => {
 
         // Deixamos a fonte menor (Fontsize=14), colocamos Arial em Negrito (Bold=1),
         // e adicionamos um contorno (Outline=1.5) e sombra (Shadow=0.5) para ficar igual aos vídeos virais!
-        const forceStyle = `Alignment=2,MarginV=${marginV},Fontname=Arial,Bold=1,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0.5`;
+        const forceStyle = `Alignment=2,MarginV=${marginV},Fontname=Helvetica Neue,Bold=1,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=0.7,Shadow=0`;
         
         finalArgs.push("-vf", `subtitles=${activeSubtitlePath}:force_style='${forceStyle}'`);
         
