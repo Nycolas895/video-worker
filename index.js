@@ -155,7 +155,7 @@ app.post("/render", async (req, res) => {
         
         await runFfmpeg([
           "-y", "-hide_banner", "-loglevel", "error",
-          "-t", "3",
+          "-t", "5",
           "-i", baseClipPaths[i],
           "-vf", vf,
           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
