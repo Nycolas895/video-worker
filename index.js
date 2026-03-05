@@ -185,14 +185,28 @@ app.post("/render", async (req, res) => {
       }
 
       console.log(`[job ${job_id}] iniciando montagem final do vídeo...`);
+      
       const finalArgs = [
         "-y", "-hide_banner", "-loglevel", "info",
         "-f", "concat", "-safe", "0", "-i", playlistPath, 
         "-i", audioPath 
       ];
 
+      // 🔥 AQUI ESTÁ A MÁGICA DA LEGENDA!
       if (activeSubtitlePath) {
-        finalArgs.push("-vf", `subtitles=${activeSubtitlePath}`);
+        // Lendo o bilhetinho do Lovable
+        const pos = output_config.subtitle_position || "bottom";
+        let alignment = 2; // Padrão é 2 (Bottom/Rodapé)
+        
+        if (pos === "top") alignment = 8;
+        if (pos === "center") alignment = 5;
+
+        // Criando o estilo customizado (ForceStyle) com a posição, tamanho e contorno
+        const forceStyle = `Alignment=${alignment},Fontsize=22,MarginV=30,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2`;
+        
+        finalArgs.push("-vf", `subtitles=${activeSubtitlePath}:force_style='${forceStyle}'`);
+        
+        console.log(`[job ${job_id}] Legenda configurada para: ${pos} (Alignment=${alignment})`);
       }
 
       finalArgs.push(
