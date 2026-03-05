@@ -16,7 +16,9 @@ const FINAL_BUCKET = process.env.FINAL_BUCKET || "final-videos";
 const DEFAULT_WIDTH = parseInt(process.env.DEFAULT_WIDTH || "480", 10);
 const DEFAULT_HEIGHT = parseInt(process.env.DEFAULT_HEIGHT || "854", 10);
 const DEFAULT_FPS = parseInt(process.env.DEFAULT_FPS || "24", 10);
-const MAX_CLIPS = parseInt(process.env.MAX_CLIPS || "3", 10);
+
+// 🔥 MUDANÇA AQUI: Ignorando qualquer variável e cravando 5 direto no código!
+const MAX_CLIPS = 5; 
 // --------------------------------------------
 
 app.get("/", (req, res) => res.send("OK"));
@@ -76,7 +78,6 @@ async function callWebhook(webhook_url, webhook_secret, payload) {
   });
 }
 
-// Função auxiliar genérica para rodar qualquer comando do ffmpeg
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
     console.log("[ffmpeg] cmd:", `ffmpeg ${args.join(" ")}`);
@@ -100,7 +101,7 @@ app.post("/render", async (req, res) => {
   const webhook_url = body.webhook_url;
   const webhook_secret = body.webhook_secret;
   const audio_url = body.audio_url;
-  const broll_urls = body.broll_urls;
+  const broll_urls = body.broll_urls || [];
   const output_config = body.output_config || {};
   
   const subtitle_url = body.subtitle_url || output_config.subtitle_url;
@@ -110,7 +111,7 @@ app.post("/render", async (req, res) => {
   const height = Number(output_config.height || DEFAULT_HEIGHT);
   const fps = Number(output_config.fps || DEFAULT_FPS);
 
-  if (!job_id || !webhook_url || !webhook_secret || !audio_url || !Array.isArray(broll_urls) || broll_urls.length === 0) {
+  if (!job_id || !webhook_url || !webhook_secret || !audio_url || broll_urls.length === 0) {
     return res.status(400).json({ error: "Campos obrigatórios ausentes" });
   }
 
@@ -128,6 +129,11 @@ app.post("/render", async (req, res) => {
     const baseClipPaths = [];
 
     try {
+      // 🔥 O NOSSO DEDO-DURO: Vai imprimir no log exatamente o que o Lovable mandou!
+      console.log(`[job ${job_id}] --------------------------------------------------`);
+      console.log(`[job ${job_id}] DETETIVE: O Lovable enviou ${broll_urls.length} links de vídeo nesta requisição!`);
+      console.log(`[job ${job_id}] --------------------------------------------------`);
+
       console.log(`[job ${job_id}] baixando áudio...`);
       await downloadToFile(audio_url, audioPath);
 
@@ -140,7 +146,6 @@ app.post("/render", async (req, res) => {
         baseClipPaths.push(cPath);
       }
 
-      // PASSO 1: PREPARAÇÃO (Cortar e formatar cada clipe separadamente - Salva Muita Memória!)
       const normalizedClips = [];
       const vf = `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p`;
 
@@ -150,19 +155,16 @@ app.post("/render", async (req, res) => {
         
         await runFfmpeg([
           "-y", "-hide_banner", "-loglevel", "error",
-          "-t", "3", // A Tesoura: corta exatamente em 3 segundos
+          "-t", "3",
           "-i", baseClipPaths[i],
           "-vf", vf,
           "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-          "-an", // Remove o áudio original do vídeo
+          "-an", 
           normPath
         ]);
         normalizedClips.push(normPath);
       }
 
-      // PASSO 2: CRIAR A PLAYLIST DE TEXTO
-      // Vamos repetir os clipes 30 vezes. 30 ciclos * 3 clipes * 3 segundos = 270 segundos (4,5 minutos).
-      // Isso cobre qualquer vídeo, e o comando "-shortest" vai cortar no tempo exato da voz.
       const playlistPath = path.join(workDir, "playlist.txt");
       let playlistContent = "";
       for (let loop = 0; loop < 30; loop++) {
@@ -172,7 +174,6 @@ app.post("/render", async (req, res) => {
       }
       fs.writeFileSync(playlistPath, playlistContent);
 
-      // Tratamento da legenda
       if (subtitle_url) {
         console.log(`[job ${job_id}] baixando arquivo de legenda...`);
         await downloadToFile(subtitle_url, srtPath);
@@ -183,12 +184,11 @@ app.post("/render", async (req, res) => {
         activeSubtitlePath = srtPath;
       }
 
-      // PASSO 3: JUNTAR TUDO (Lendo a playlist e adicionando o áudio e a legenda)
       console.log(`[job ${job_id}] iniciando montagem final do vídeo...`);
       const finalArgs = [
         "-y", "-hide_banner", "-loglevel", "info",
-        "-f", "concat", "-safe", "0", "-i", playlistPath, // Lê a playlist de vídeos
-        "-i", audioPath // Lê o áudio
+        "-f", "concat", "-safe", "0", "-i", playlistPath, 
+        "-i", audioPath 
       ];
 
       if (activeSubtitlePath) {
@@ -201,7 +201,7 @@ app.post("/render", async (req, res) => {
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
-        "-shortest", // Corta a imagem EXATAMENTE na hora que a voz acaba
+        "-shortest", 
         outputPath
       );
 
