@@ -196,17 +196,21 @@ app.post("/render", async (req, res) => {
       if (activeSubtitlePath) {
         // Lendo o bilhetinho do Lovable
         const pos = output_config.subtitle_position || "bottom";
-        let alignment = 2; // Padrão é 2 (Bottom/Rodapé)
         
-        if (pos === "top") alignment = 8;
-        if (pos === "center") alignment = 5;
+        // Vamos alinhar sempre por baixo e no centro (Alignment=2)
+        // E vamos empurrar a legenda para cima mudando a Margem Vertical (MarginV)
+        let marginV = 15; // "Bem baixa" (Quase na margem inferior)
+        
+        if (pos === "center") marginV = 50;  // "Média" (Um pouco acima)
+        if (pos === "top") marginV = 120;    // "Normal" (Mais perto do meio, como na sua referência)
 
-        // Criando o estilo customizado (ForceStyle) com a posição, tamanho e contorno
-        const forceStyle = `Alignment=${alignment},Fontsize=22,MarginV=30,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2`;
+        // Deixamos a fonte menor (Fontsize=14), colocamos Arial em Negrito (Bold=1),
+        // e adicionamos um contorno (Outline=1.5) e sombra (Shadow=0.5) para ficar igual aos vídeos virais!
+        const forceStyle = `Alignment=2,MarginV=${marginV},Fontname=Arial,Bold=1,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0.5`;
         
         finalArgs.push("-vf", `subtitles=${activeSubtitlePath}:force_style='${forceStyle}'`);
         
-        console.log(`[job ${job_id}] Legenda configurada para: ${pos} (Alignment=${alignment})`);
+        console.log(`[job ${job_id}] Legenda configurada para botão ${pos} com Margem=${marginV}`);
       }
 
       finalArgs.push(
