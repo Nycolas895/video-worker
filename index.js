@@ -236,19 +236,15 @@ app.post("/render", async (req, res) => {
       ];
 
       // Legenda intocada conforme o seu estilo!
-      if (activeSubtitlePath) {
-        const pos = output_config.subtitle_position || "bottom";
-        
-        let marginV = 15; 
-        if (pos === "center") marginV = 50; 
-        if (pos === "top") marginV = 120; 
+     if (activeSubtitlePath) {
+        // Ignoramos a variável do app e travamos a margem em 50 (Centro)
+        let marginV = 50; 
 
-        // Adicionado um "t=0" (ou omitido) mas as legendas seguem a formatação correta
         const forceStyle = `Alignment=2,MarginV=${marginV},Fontname=Montserrat,Bold=1,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=0.7,Shadow=0`;
         
         finalArgs.push("-vf", `subtitles=${activeSubtitlePath}:force_style='${forceStyle}'`);
         
-        console.log(`[job ${job_id}] Legenda configurada: Margem=${marginV}`);
+        console.log(`[job ${job_id}] Legenda FIXADA na posição Centro (Margem=${marginV})`);
       }
 
       finalArgs.push(
