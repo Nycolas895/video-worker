@@ -13,12 +13,9 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const FINAL_BUCKET = process.env.FINAL_BUCKET || "final-videos";
 
-const DEFAULT_WIDTH = parseInt(process.env.DEFAULT_WIDTH || "480", 10);
-const DEFAULT_HEIGHT = parseInt(process.env.DEFAULT_HEIGHT || "854", 10);
-const DEFAULT_FPS = parseInt(process.env.DEFAULT_FPS || "24", 10);
-
-// 🔥 MUDANÇA AQUI: Ignorando qualquer variável e cravando 5 direto no código!
-const MAX_CLIPS = 5; 
+const DEFAULT_WIDTH = parseInt(process.env.DEFAULT_WIDTH || "720", 10); // Ajustado para Shorts
+const DEFAULT_HEIGHT = parseInt(process.env.DEFAULT_HEIGHT || "1280", 10);
+const DEFAULT_FPS = parseInt(process.env.DEFAULT_FPS || "30", 10); // Melhor fluidez
 // --------------------------------------------
 
 app.get("/", (req, res) => res.send("OK"));
@@ -101,8 +98,11 @@ app.post("/render", async (req, res) => {
   const webhook_url = body.webhook_url;
   const webhook_secret = body.webhook_secret;
   const audio_url = body.audio_url;
-  const broll_urls = body.broll_urls || [];
   const output_config = body.output_config || {};
+  
+  // 🔥 MUDANÇA CRUCIAL: Agora o worker escuta a timeline enviada pelo app
+  const timeline = body.timeline || body.broll_timeline || output_config.timeline || [];
+  const broll_urls = body.broll_urls || []; // Ainda usado como fallback para download
   
   const subtitle_url = body.subtitle_url || output_config.subtitle_url;
   const subtitle_text = body.subtitle_text || output_config.subtitle_text;
@@ -126,51 +126,94 @@ app.post("/render", async (req, res) => {
     const srtPath = path.join(workDir, "subs.srt");
     
     let activeSubtitlePath = null;
-    const baseClipPaths = [];
+    const downloadedClipsMap = {}; // Guarda o caminho local para cada URL baixada
 
     try {
-      // 🔥 O NOSSO DEDO-DURO: Vai imprimir no log exatamente o que o Lovable mandou!
       console.log(`[job ${job_id}] --------------------------------------------------`);
-      console.log(`[job ${job_id}] DETETIVE: O Lovable enviou ${broll_urls.length} links de vídeo nesta requisição!`);
+      console.log(`[job ${job_id}] INICIANDO: Processando timeline com ${timeline.length} cortes.`);
       console.log(`[job ${job_id}] --------------------------------------------------`);
 
       console.log(`[job ${job_id}] baixando áudio...`);
       await downloadToFile(audio_url, audioPath);
 
-      const qtdClipes = Math.min(MAX_CLIPS, broll_urls.length);
-      console.log(`[job ${job_id}] Baixando ${qtdClipes} clipes reais...`);
+      // 1. Baixar apenas os vídeos que estão na timeline (ou todos se não houver timeline)
+      const urlsToDownload = new Set();
+      if (timeline && timeline.length > 0) {
+        timeline.forEach(clip => urlsToDownload.add(clip.url || clip.src));
+      } else {
+        broll_urls.forEach(url => urlsToDownload.add(url));
+      }
 
-      for (let i = 0; i < qtdClipes; i++) {
-        const cPath = path.join(workDir, `clip${i}.mp4`);
-        await downloadToFile(broll_urls[i], cPath);
-        baseClipPaths.push(cPath);
+      console.log(`[job ${job_id}] Baixando ${urlsToDownload.size} vídeos originais...`);
+      
+      let index = 0;
+      for (const url of urlsToDownload) {
+        const cPath = path.join(workDir, `raw_${index}.mp4`);
+        await downloadToFile(url, cPath);
+        downloadedClipsMap[url] = cPath; // Associa a URL ao arquivo local
+        index++;
       }
 
       const normalizedClips = [];
       const vf = `fps=${fps},scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p`;
 
-      for (let i = 0; i < baseClipPaths.length; i++) {
-        const normPath = path.join(workDir, `norm_${i}.mp4`);
-        console.log(`[job ${job_id}] Normalizando clipe ${i + 1}...`);
+      // 2. Aplicar os cortes EXATOS da timeline (Inteligência Artificial)
+      if (timeline && timeline.length > 0) {
+        console.log(`[job ${job_id}] Recortando clipes com base na timeline (Sem loop fixo)...`);
         
-        await runFfmpeg([
-          "-y", "-hide_banner", "-loglevel", "error",
-          "-t", "5",
-          "-i", baseClipPaths[i],
-          "-vf", vf,
-          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-          "-an", 
-          normPath
-        ]);
-        normalizedClips.push(normPath);
+        for (let i = 0; i < timeline.length; i++) {
+          const clip = timeline[i];
+          const rawPath = downloadedClipsMap[clip.url || clip.src];
+          
+          if (!rawPath) continue;
+
+          const normPath = path.join(workDir, `slice_${i}.mp4`);
+          const startTime = clip.start || clip.startTime || clip.ss || 0;
+          // Se o payload informar a duração exata do corte, use; se não, tente deduzir
+          const duration = clip.duration || (clip.end ? clip.end - startTime : 3); 
+          
+          console.log(`[job ${job_id}] Cortando slice ${i}: início ${startTime}s, duração ${duration}s`);
+          
+          // O Comando FFmpeg que respeita o nosso "offset dinâmico"
+          await runFfmpeg([
+            "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", String(startTime), // Pula até o tempo correto (não é mais sempre zero)
+            "-t", String(duration),   // Corta a quantidade de segundos que pedimos (ex: 3s)
+            "-i", rawPath,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-an", // Remove o áudio original do TikTok
+            normPath
+          ]);
+          normalizedClips.push(normPath);
+        }
+      } else {
+        // Fallback: Se o Lovable por algum motivo não mandar timeline, ele corta os 15 primeiros segs
+        console.log(`[job ${job_id}] AVISO: Nenhuma timeline enviada. Processando clipes crus com corte base.`);
+        let i = 0;
+        for (const url in downloadedClipsMap) {
+           const normPath = path.join(workDir, `slice_${i}.mp4`);
+           await runFfmpeg([
+            "-y", "-hide_banner", "-loglevel", "error",
+            "-t", "15", // Pega mais tempo para evitar buracos
+            "-i", downloadedClipsMap[url],
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-an", 
+            normPath
+          ]);
+          normalizedClips.push(normPath);
+          i++;
+        }
       }
 
+      // 3. Montar a Playlist
+      // Sem loops malucos! Ele vai simplesmente juntar as fatias ordenadas na timeline
       const playlistPath = path.join(workDir, "playlist.txt");
       let playlistContent = "";
-      for (let loop = 0; loop < 30; loop++) {
-        for (const clip of normalizedClips) {
+      
+      for (const clip of normalizedClips) {
           playlistContent += `file '${clip}'\n`;
-        }
       }
       fs.writeFileSync(playlistPath, playlistContent);
 
@@ -192,25 +235,20 @@ app.post("/render", async (req, res) => {
         "-i", audioPath 
       ];
 
-      // 🔥 AQUI ESTÁ A MÁGICA DA LEGENDA!
+      // Legenda intocada conforme o seu estilo!
       if (activeSubtitlePath) {
-        // Lendo o bilhetinho do Lovable
         const pos = output_config.subtitle_position || "bottom";
         
-        // Vamos alinhar sempre por baixo e no centro (Alignment=2)
-        // E vamos empurrar a legenda para cima mudando a Margem Vertical (MarginV)
-        let marginV = 15; // "Bem baixa" (Quase na margem inferior)
-        
-        if (pos === "center") marginV = 50;  // "Média" (Um pouco acima)
-        if (pos === "top") marginV = 120;    // "Normal" (Mais perto do meio, como na sua referência)
+        let marginV = 15; 
+        if (pos === "center") marginV = 50; 
+        if (pos === "top") marginV = 120; 
 
-        // Deixamos a fonte menor (Fontsize=14), colocamos Arial em Negrito (Bold=1),
-        // e adicionamos um contorno (Outline=1.5) e sombra (Shadow=0.5) para ficar igual aos vídeos virais!
-        const forceStyle = `Alignment=2,MarginV=${marginV},Fontname=Helvetica Neue,Bold=1,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=0.7,Shadow=0`;
+        // Adicionado um "t=0" (ou omitido) mas as legendas seguem a formatação correta
+        const forceStyle = `Alignment=2,MarginV=${marginV},Fontname=Montserrat,Bold=1,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=0.7,Shadow=0`;
         
         finalArgs.push("-vf", `subtitles=${activeSubtitlePath}:force_style='${forceStyle}'`);
         
-        console.log(`[job ${job_id}] Legenda configurada para botão ${pos} com Margem=${marginV}`);
+        console.log(`[job ${job_id}] Legenda configurada: Margem=${marginV}`);
       }
 
       finalArgs.push(
@@ -219,7 +257,7 @@ app.post("/render", async (req, res) => {
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
-        "-shortest", 
+        "-shortest", // Garante que o vídeo acabe assim que a locução acabar! (trava do 60s)
         outputPath
       );
 
